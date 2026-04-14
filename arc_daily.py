@@ -698,8 +698,8 @@ async def register_events(page: Page, email: str, acct_state: dict) -> int:
             await page.keyboard.press("Escape")
             await human_delay(2, 3)
 
-        except Exception as e:
-            log.warning(f"[{email}]   注册失败 index={i}: {e}")
+        except Exception:
+            pass  # 按钮超时/不可点击，静默跳过
 
     log.info(f"[{email}] Events 完成：注册 {registered_count} 个活动 (+{registered_count*5}分)")
     return registered_count
