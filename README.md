@@ -1,4 +1,4 @@
-# arc-bot （转漆华老师）
+# arc-bot 
 
 
 pip install -r requirements.txt
