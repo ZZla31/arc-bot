@@ -182,7 +182,12 @@ def load_gmail_passes(count: int) -> list[str]:
         log.warning(f"gmail_passes.txt 有 {len(passes)} 条，多于账号数 {count}，多余行已忽略。")
 
     log.info(f"加载 {count} 条 Gmail 应用密码")
-    return passes[:count]
+    # 【修复】去除密码中的空格和非ASCII字符，避免IMAP编码错误
+    cleaned = []
+    for p in passes[:count]:
+        p_clean = p.replace(" ", "").replace("\xa0", "").encode("ascii", "ignore").decode("ascii")
+        cleaned.append(p_clean)
+    return cleaned
 
 
 # ─── 代理文件读取 ─────────────────────────────────────────────────────────────
@@ -416,16 +421,21 @@ def fetch_magic_link(email: str, app_pass: str, timeout_sec: int = 90) -> str | 
     log.info(f"[{email}] IMAP: 等待 magic link（最多 {timeout_sec} 秒）...")
     deadline = datetime.now(timezone.utc) + timedelta(seconds=timeout_sec)
 
+    # 【修复】确保密码是纯ASCII，去除空格和不间断空格
+    app_pass = app_pass.replace(" ", "").replace("\xa0", "").encode("ascii", "ignore").decode("ascii")
+
     while datetime.now(timezone.utc) < deadline:
         try:
             mail = imaplib.IMAP4_SSL("imap.gmail.com", 993)
             mail.login(email, app_pass)
             mail.select("INBOX")
 
+            # 【修复】日期也确保是纯ASCII
             since = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime("%d-%b-%Y")
+            since = since.encode("ascii", "ignore").decode("ascii")
 
-            # 精确搜索
-            _, data = mail.search(None, f'(UNSEEN SINCE "{since}" FROM "circle")')
+            # 【修复】搜索关键词改为 arc.network，匹配实际发件人
+            _, data = mail.search(None, f'(UNSEEN SINCE "{since}" FROM "arc.network")')
             if not data or not data[0]:
                 _, data = mail.search(None, f'(UNSEEN SINCE "{since}")')
 
@@ -506,16 +516,13 @@ async def get_score(page: Page, email: str) -> int | None:
 
         # 尝试多种积分选择器
         score_selectors = [
-            # 常见积分/点数显示
             "[class*='point' i]",
             "[class*='score' i]",
             "[class*='credit' i]",
             "[class*='reward' i]",
-            # 数字+文字组合
             "span:has-text('points')",
             "span:has-text('Points')",
             "div:has-text('points')",
-            # 通用数字展示
             "[class*='stat'] [class*='number']",
             "[class*='badge'] [class*='count']",
         ]
@@ -526,7 +533,6 @@ async def get_score(page: Page, email: str) -> int | None:
                 count = await els.count()
                 for i in range(min(count, 5)):
                     text = (await els.nth(i).text_content() or "").strip()
-                    # 提取数字
                     nums = re.findall(r'\d[\d,]*', text.replace(",", ""))
                     if nums:
                         score = int(nums[0].replace(",", ""))
@@ -536,7 +542,6 @@ async def get_score(page: Page, email: str) -> int | None:
             except Exception:
                 continue
 
-        # 截图方便人工检查
         await page.screenshot(path=str(LOG_DIR / f"profile_{email.split('@')[0]}.png"))
         log.warning(f"[{email}] 未能自动读取积分，已截图")
         return None
@@ -552,7 +557,6 @@ async def is_logged_in(page: Page) -> bool:
     url = page.url
     if "sign_in" in url or "login" in url.lower():
         return False
-    # 检查是否存在登出按钮 / 用户头像 / 用户菜单（表示已登录）
     logged_in_selectors = [
         "[class*='avatar' i]",
         "[class*='user-menu' i]",
@@ -570,7 +574,6 @@ async def is_logged_in(page: Page) -> bool:
                 return True
         except Exception:
             continue
-    # 如果 URL 不含 sign_in 且不是 404，也认为登录成功
     if "sign_in" not in url and "404" not in url and url != BASE_URL + "/":
         return True
     return False
@@ -581,6 +584,22 @@ async def login(page: Page, account: Account) -> bool:
     log.info(f"[{account.email}] 开始登录（Magic Link）...")
     await page.goto(f"{BASE_URL}/home/sign_in", wait_until="domcontentloaded", timeout=60000)
     await human_delay(3, 5)
+
+    # 【修复】关闭 OneTrust Cookie 同意弹窗，避免遮挡登录按钮
+    try:
+        accept_btn = page.locator(
+            "button#onetrust-accept-btn-handler, "
+            "button:has-text('Accept All'), "
+            "button:has-text('Accept Cookies'), "
+            "button:has-text('I Accept'), "
+            "button:has-text('Agree')"
+        ).first
+        if await accept_btn.is_visible(timeout=5000):
+            await accept_btn.click()
+            await human_delay(1, 2)
+            log.info(f"[{account.email}] 已关闭 Cookie 弹窗")
+    except Exception:
+        pass  # 没有弹窗就跳过
 
     email_input = page.locator(
         "input[type='email'], input[name='email'], input[placeholder*='email' i]"
@@ -607,18 +626,14 @@ async def login(page: Page, account: Account) -> bool:
 
     log.info(f"[{account.email}] magic link: {magic_link}")
     resp = await page.goto(magic_link, wait_until="domcontentloaded", timeout=60000)
-    # 等待 cookie / session 写入稳定
     await human_delay(3, 5)
 
-    # magic link 落地页可能是 404（token 已消耗，但 cookie 已写入）
-    # 无论 404 与否，都跳转到 /home 继续
     if resp and resp.status == 404:
         log.warning(f"[{account.email}] magic link 落地页 404（正常），等待 session 写入后跳转...")
-        await asyncio.sleep(3)  # 额外等待确保 cookie 写入
+        await asyncio.sleep(3)
         await page.goto(f"{BASE_URL}/home", wait_until="domcontentloaded", timeout=60000)
         await human_delay(3, 5)
     else:
-        # 落地页正常，等待可能的自动跳转
         try:
             await page.wait_for_url(
                 lambda u: "sign_in" not in u and "magic" not in u.lower(),
@@ -628,7 +643,6 @@ async def login(page: Page, account: Account) -> bool:
             pass
         await human_delay(2, 3)
 
-    # 页面上可能有一个"确认登录"按钮需要点击
     confirm_selectors = [
         "button:has-text('Confirm')",
         "button:has-text('Sign in')",
@@ -648,21 +662,18 @@ async def login(page: Page, account: Account) -> bool:
         except Exception:
             continue
 
-    # 如果还在登录页，主动跳转到 /home
     current_url = page.url
     if "sign_in" in current_url or "magic" in current_url.lower():
         log.warning(f"[{account.email}] 仍在登录页，主动跳转 /home...")
         await page.goto(f"{BASE_URL}/home", wait_until="domcontentloaded", timeout=60000)
         await human_delay(3, 5)
 
-    # 截图记录当前页面状态
     screenshot_path = str(SCRIPT_DIR / f"login_result_{account.email.split('@')[0]}.png")
     await page.screenshot(path=screenshot_path)
 
     current_url = page.url
     log.info(f"[{account.email}] 登录后 URL: {current_url}")
 
-    # 验证登录态
     logged_in = await is_logged_in(page)
     if logged_in:
         log.info(f"[{account.email}] 登录成功 ✓")
@@ -683,16 +694,13 @@ async def read_content(page: Page, email: str, acct_state: dict) -> dict:
     TARGET_ARTICLES = 5
     TARGET_VIDEOS   = 1
 
-    # 已读记录（按邮箱隔离，持久化在 arc_state.json）
     read_history: list = acct_state.get("read_articles", [])
 
-    # 直接获取内容链接，不等待 visible（导航栏也有 /home/ 链接会导致 wait_for_selector 超时）
     links = await page.locator(
         "a[href*='/home/blogs/'], a[href*='/home/externals/'], a[href*='/home/videos/'], "
         "a[href*='/home/content/'], a[href*='/home/posts/'], a[href*='/home/articles/']"
     ).all()
 
-    # 如果专用选择器没找到内容，降级用所有 /home/ 下的链接（过滤掉导航项）
     if len(links) == 0:
         all_links = await page.locator("a[href*='/home/']").all()
         nav_keywords = ["sign_in", "sign_out", "profile", "settings", "events", "forum",
@@ -711,13 +719,11 @@ async def read_content(page: Page, email: str, acct_state: dict) -> dict:
 
     log.info(f"[{email}] 发现 {len(hrefs)} 个内容链接")
 
-    # 过滤掉已读过的文章（视频不做去重，数量少）
     new_hrefs  = [h for h in hrefs if h not in read_history or "/videos/" in h]
     skip_count = len(hrefs) - len(new_hrefs)
     if skip_count > 0:
         log.info(f"[{email}] 跳过已读文章 {skip_count} 篇，剩余新内容 {len(new_hrefs)} 篇")
 
-    # 如果新内容不够 5 篇，把已读的也补进来（保证任务能完成）
     if len(new_hrefs) < TARGET_ARTICLES:
         already_read = [h for h in hrefs if h in read_history and "/videos/" not in h]
         needed = TARGET_ARTICLES - len(new_hrefs)
@@ -750,7 +756,6 @@ async def read_content(page: Page, email: str, acct_state: dict) -> dict:
                 videos_watched += 1
             else:
                 articles_read += 1
-                # 记录已读（用规范化的 href 存储，避免 http/https 差异）
                 if href not in read_history:
                     read_history.append(href)
                     acct_state["read_articles"] = read_history
@@ -829,7 +834,7 @@ async def register_events(page: Page, email: str, acct_state: dict) -> int:
             await human_delay(2, 3)
 
         except Exception:
-            pass  # 按钮超时/不可点击，静默跳过
+            pass
 
     log.info(f"[{email}] Events 完成：注册 {registered_count} 个活动 (+{registered_count*5}分)")
     return registered_count
@@ -838,7 +843,7 @@ async def register_events(page: Page, email: str, acct_state: dict) -> int:
 # ─── 任务 4：发帖 ─────────────────────────────────────────────────────────────
 async def find_forum_url(page: Page, email: str) -> str:
     """尝试从导航栏找到 forum/discussions 的真实路径"""
-    forum_url = f"{BASE_URL}/home/forum"  # 默认猜测
+    forum_url = f"{BASE_URL}/home/forum"
     try:
         nav_links = await page.locator("nav a, aside a, [class*='sidebar'] a, [class*='nav'] a").all()
         for lnk in nav_links:
@@ -880,14 +885,12 @@ async def create_post(page: Page, email: str) -> bool:
         await create_btn.click(timeout=8000)
         await human_delay(2, 3)
 
-        # 标题
         title_input = page.locator("input[placeholder*='title' i], input[name='title']").first
         if await title_input.is_visible(timeout=5000):
             today_str = datetime.now().strftime("%B %d")
             await title_input.fill(f"Daily Discussion – {today_str}")
             await human_delay(0.5, 1.5)
 
-        # 正文（每个账号用不同模板）
         post_text = random.choice(POST_TEMPLATES)
         body_filled = False
         for sel in ["div[contenteditable='true']", "textarea", ".ql-editor", "div[role='textbox']"]:
@@ -963,7 +966,6 @@ async def comment_on_posts(page: Page, email: str) -> int:
             hrefs.append(href)
 
     log.info(f"[{email}] 发现 {len(hrefs)} 个帖子")
-    # 跳过前1个（可能是自己刚发的），多取几个备用
     target_posts = hrefs[1:TARGET + 4] if len(hrefs) > 1 else hrefs
 
     for href in target_posts:
@@ -986,7 +988,6 @@ async def comment_on_posts(page: Page, email: str) -> int:
                 "div[role='textbox']",
             ]
 
-            # 先尝试直接找输入框
             for sel in comment_sels:
                 try:
                     cb = page.locator(sel).first
@@ -999,7 +1000,6 @@ async def comment_on_posts(page: Page, email: str) -> int:
                 except Exception:
                     continue
 
-            # 若没找到，尝试点击触发按钮
             if not comment_filled:
                 try:
                     trigger = page.locator(
@@ -1066,7 +1066,6 @@ async def run_account(account: Account, browser: Browser, state: dict) -> Accoun
     result = AccountResult(email=account.email)
     acct_state = get_account_state(state, account.email)
 
-    # session 文件路径（按邮箱前缀命名）
     session_file = SESSIONS_DIR / f"{account.email.split('@')[0]}.json"
 
     ctx_kwargs: dict = dict(
@@ -1082,7 +1081,6 @@ async def run_account(account: Account, browser: Browser, state: dict) -> Accoun
         ctx_kwargs["proxy"] = parse_proxy(account.proxy)
         log.info(f"[{account.email}] 使用代理: {account.proxy.split('@')[-1]}")
 
-    # 如果有保存的 session，先尝试直接加载
     session_ok = False
     if session_file.exists():
         log.info(f"[{account.email}] 发现已保存的 session，尝试直接使用...")
@@ -1114,7 +1112,6 @@ async def run_account(account: Account, browser: Browser, state: dict) -> Accoun
             session_file.unlink(missing_ok=True)
             session_ok = False
 
-    # 没有有效 session，走正常登录流程
     if not session_ok:
         ctx_kwargs.pop("storage_state", None)
         context: BrowserContext = await browser.new_context(**ctx_kwargs)
@@ -1128,7 +1125,6 @@ async def run_account(account: Account, browser: Browser, state: dict) -> Accoun
             await context.close()
             return result
 
-        # 登录成功后保存 session
         try:
             await context.storage_state(path=str(session_file))
             log.info(f"[{account.email}] Session 已保存 → {session_file.name}")
@@ -1136,10 +1132,8 @@ async def run_account(account: Account, browser: Browser, state: dict) -> Accoun
             log.warning(f"[{account.email}] 保存 session 失败: {e}")
 
     try:
-        # 读取任务前积分
         result.score_before = await get_score(page, account.email)
 
-        # 执行任务
         content_result   = await read_content(page, account.email, acct_state)
         await human_delay(3, 6)
 
@@ -1159,13 +1153,11 @@ async def run_account(account: Account, browser: Browser, state: dict) -> Accoun
             "comments":  comment_count,
         }
 
-        # 读取任务后积分
         await human_delay(3, 6)
         result.score_after = await get_score(page, account.email)
 
         acct_state["last_run"] = datetime.now().isoformat()
 
-        # 任务完成后刷新保存 session（保持最新 cookie）
         try:
             await context.storage_state(path=str(session_file))
             log.info(f"[{account.email}] Session 已更新")
@@ -1215,7 +1207,6 @@ def print_summary(results: list[AccountResult]):
     print(f"  共 {len(results)} 个账号  |  本次合计积分: +{total_gained}")
     print(sep)
 
-    # 同时写入日志
     log.info(f"汇总：{len(results)} 个账号，合计 +{total_gained} 积分")
 
 
@@ -1245,7 +1236,6 @@ async def run_once():
             ],
         )
 
-        # 账号依次串行执行（避免同时多个浏览器触发反爬）
         for i, account in enumerate(accounts, 1):
             log.info(f"\n{'─'*60}")
             log.info(f"账号 {i}/{len(accounts)}: {account.email}")
@@ -1255,7 +1245,6 @@ async def run_once():
             results.append(result)
             save_state(state)
 
-            # 账号之间随机间隔 30-90 秒
             if i < len(accounts):
                 wait = random.randint(30, 90)
                 log.info(f"等待 {wait} 秒后处理下一个账号...")
@@ -1274,7 +1263,7 @@ async def main():
     log.info("=" * 60)
 
     run_count = 0
-    INTERVAL  = 24 * 60 * 60  # 24 小时（秒）
+    INTERVAL  = 24 * 60 * 60
 
     while True:
         run_count += 1
@@ -1309,18 +1298,14 @@ def setup():
     print("  Arc Network 脚本 — 首次部署向导")
     print("=" * 60)
 
-    # 1. 安装 playwright
     print("\n[1/3] 安装 playwright...")
     subprocess.run([sys.executable, "-m", "pip", "install", "playwright", "-q"], check=True)
 
-    # 2. 安装 Chromium
     print("[2/3] 安装 Chromium 浏览器...")
     subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
-    # Linux 上额外安装系统依赖
     if platform.system() == "Linux":
         subprocess.run([sys.executable, "-m", "playwright", "install-deps", "chromium"], check=True)
 
-    # 3. 校验配置文件存在
     print("[3/3] 检查配置文件...")
     for fname, hint in [
         (ACCOUNTS_FILE,     "填写每行一个 Arc 登录邮箱"),
@@ -1337,7 +1322,6 @@ def setup():
                      if l.strip() and not l.strip().startswith("#")]
             print(f"  ✓  {fname.name} — {len(lines)} 条记录")
 
-    # 4. 配置 cron（仅 Linux/macOS）
     if platform.system() in ("Linux", "Darwin"):
         python_bin = sys.executable
         script_path = Path(__file__).resolve()
