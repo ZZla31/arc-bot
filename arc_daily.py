@@ -716,7 +716,6 @@ async def login(page: Page, account: Account) -> bool:
 # ─── 任务 1 & 2：阅读文章 + 观看视频 ─────────────────────────────────────────
 async def read_content(page: Page, email: str, acct_state: dict) -> dict:
     log.info(f"[{email}] === 任务1&2：Content 阅读文章 + 视频 ===")
-    # ✅ 修复：使用正确的内容页 URL
     await page.goto(CONTENT_URL, wait_until="domcontentloaded")
     await human_delay(3, 5)
 
@@ -727,33 +726,38 @@ async def read_content(page: Page, email: str, acct_state: dict) -> dict:
 
     read_history: list = acct_state.get("read_articles", [])
 
-    # ✅ 修复：内容链接现在是 /en/public/ 前缀
-    links = await page.locator(
-        "a[href*='/en/public/blogs/'], a[href*='/en/public/externals/'], "
-        "a[href*='/en/public/videos/'], a[href*='/en/home/blogs/'], "
-        "a[href*='/en/home/externals/'], a[href*='/en/home/videos/']"
-    ).all()
-
-    # 降级：扫描所有内容类链接
-    if len(links) == 0:
-        all_links = await page.locator("a[href*='/en/']").all()
-        nav_keywords = ["sign_in", "sign_out", "profile", "settings", "events",
-                        "forum", "content", "notifications", "members", "leaderboard",
-                        "clubs", "albums", "resources", "collections"]
-        filtered = []
-        for lnk in all_links:
-            href = await lnk.get_attribute("href") or ""
-            if not any(kw in href for kw in nav_keywords):
-                filtered.append(lnk)
-        links = filtered
-        log.info(f"[{email}] 降级模式：过滤后得到 {len(links)} 个内容链接")
-
-    hrefs = []
-    for lnk in links:
-        href = await lnk.get_attribute("href")
-        if href and href not in hrefs:
-            hrefs.append(href)
-
+    # ✅ 修复1：用 JS 一次性提取所有内容链接，避免 locator.all() 逐个操作超时
+    hrefs: list[str] = await page.evaluate('''
+        () => {
+            const seen = new Set();
+            const results = [];
+            const patterns = [
+                "/en/public/blogs/", "/en/public/externals/", "/en/public/videos/",
+                "/en/home/blogs/",   "/en/home/externals/",   "/en/home/videos/"
+            ];
+            document.querySelectorAll("a[href]").forEach(a => {
+                const h = a.href || "";
+                if (patterns.some(p => h.includes(p)) && !seen.has(h)) {
+                    seen.add(h);
+                    results.push(h);
+                }
+            });
+            // 降级：如果没找到，扫描所有 /en/ 链接排除导航项
+            if (results.length === 0) {
+                const nav = ["sign_in","sign_out","profile","settings","events","forum",
+                             "content","notifications","members","leaderboard","clubs",
+                             "albums","resources","collections"];
+                document.querySelectorAll("a[href*='/en/']").forEach(a => {
+                    const h = a.href || "";
+                    if (!nav.some(kw => h.includes(kw)) && !seen.has(h)) {
+                        seen.add(h);
+                        results.push(h);
+                    }
+                });
+            }
+            return results;
+        }
+    ''')
     log.info(f"[{email}] 发现 {len(hrefs)} 个内容链接")
 
     new_hrefs  = [h for h in hrefs if h not in read_history or "/videos/" in h]
@@ -780,7 +784,6 @@ async def read_content(page: Page, email: str, acct_state: dict) -> dict:
         if not is_video and articles_read >= TARGET_ARTICLES:
             continue
 
-        # ✅ 修复：/en/public/ 链接转为 /en/home/ 才能在登录态访问
         url = href if href.startswith("http") else f"{BASE_URL}{href}"
         url = url.replace("/en/public/", "/en/home/")
 
@@ -812,7 +815,6 @@ async def read_content(page: Page, email: str, acct_state: dict) -> dict:
 # ─── 任务 3：Events 注册 ──────────────────────────────────────────────────────
 async def register_events(page: Page, email: str, acct_state: dict) -> int:
     log.info(f"[{email}] === 任务3：Events 注册新活动 ===")
-    # ✅ 修复：使用正确的活动页 URL
     await page.goto(EVENTS_URL, wait_until="domcontentloaded")
     await human_delay(2, 3)
 
@@ -827,26 +829,23 @@ async def register_events(page: Page, email: str, acct_state: dict) -> int:
     except Exception:
         pass
 
-    # ✅ 新增：优先处理带 autoRsvp=true 的链接（直接访问即完成注册，不会超时）
-    auto_rsvp_links = await page.locator("a[href*='autoRsvp=true']").all()
-    for lnk in auto_rsvp_links:
-        href = await lnk.get_attribute("href") or ""
+    # ✅ 修复2：用 JS 一次性提取所有 autoRsvp href，避免 locator.all() 逐个操作超时
+    auto_rsvp_hrefs: list[str] = await page.evaluate('''
+        () => Array.from(document.querySelectorAll("a[href*='autoRsvp=true']"))
+                   .map(a => a.href)
+                   .filter(h => h)
+    ''')
+    log.info(f"[{email}] 发现 {len(auto_rsvp_hrefs)} 个 autoRsvp 活动")
+
+    for href in auto_rsvp_hrefs:
         slug = href.split("/events/")[-1].split("?")[0]
-        title = slug
-        try:
-            card = lnk.locator("xpath=ancestor::div[contains(@class,'card') or contains(@class,'Card')]").first
-            title_el = card.locator("h3, h2, h4").first
-            if await title_el.count() > 0:
-                title = (await title_el.text_content() or slug).strip()
-        except Exception:
-            pass
+        title = slug  # 用 slug 作为去重 key
 
         if title in acct_state["registered_events"]:
             log.info(f"[{email}]   跳过（已注册）: {title}")
             continue
 
-        url = href if href.startswith("http") else f"{BASE_URL}{href}"
-        url = url.replace("/en/public/", "/en/home/")
+        url = href.replace("/en/public/", "/en/home/")
         log.info(f"[{email}]   autoRsvp 注册: {title}")
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
@@ -854,42 +853,60 @@ async def register_events(page: Page, email: str, acct_state: dict) -> int:
             acct_state["registered_events"].append(title)
             registered_count += 1
             log.info(f"[{email}]   注册成功 (+5分): {title}")
-            await page.go_back()
+            await page.goto(EVENTS_URL, wait_until="domcontentloaded", timeout=30000)
             await human_delay(2, 3)
         except Exception as e:
             log.warning(f"[{email}]   autoRsvp 注册失败: {e}")
-
-    # 再处理普通 Register 按钮
-    register_btns = page.locator("a:has-text('Register'), button:has-text('Register')")
-    count = await register_btns.count()
-    log.info(f"[{email}] 发现 {count} 个 Register 按钮")
-
-    for i in range(count):
-        btn = register_btns.nth(i)
-        try:
             try:
-                card = btn.locator("xpath=ancestor::div[contains(@class,'card') or contains(@class,'Card') or contains(@class,'event')]").first
-                title_el = card.locator("h3, h2, h4").first
-                title = (await title_el.text_content() if await title_el.count() > 0 else f"Event_{i}").strip()
-            except Exception:
-                title = f"Event_{i}"
-
-            if title in acct_state["registered_events"]:
-                log.info(f"[{email}]   跳过（已注册）: {title}")
-                continue
-
-            log.info(f"[{email}]   注册: {title}")
-            try:
-                await btn.scroll_into_view_if_needed(timeout=5000)
+                await page.goto(EVENTS_URL, wait_until="domcontentloaded", timeout=30000)
             except Exception:
                 pass
-            await human_delay(1, 2)
-            await btn.click(timeout=15000)  # ✅ 增加超时时间避免超时报错
+
+    # ✅ 修复3：用 JS 一次性提取普通 Register 按钮的 href + 标题，避免 locator 超时
+    event_infos: list[dict] = await page.evaluate('''
+        () => {
+            const results = [];
+            document.querySelectorAll("a").forEach(a => {
+                const txt = (a.textContent || "").trim();
+                if (txt !== "Register") return;
+                if ((a.href || "").includes("autoRsvp")) return;
+                let card = a;
+                for (let i = 0; i < 6; i++) {
+                    card = card.parentElement;
+                    if (!card) break;
+                    const h = card.querySelector("h2,h3,h4");
+                    if (h) {
+                        results.push({href: a.href, title: h.textContent.trim()});
+                        return;
+                    }
+                }
+                results.push({href: a.href, title: a.href.split("/events/").pop().split("?")[0]});
+            });
+            return results;
+        }
+    ''')
+    log.info(f"[{email}] 发现 {len(event_infos)} 个 Register 按钮")
+
+    for info in event_infos:
+        href  = info.get("href", "")
+        title = info.get("title") or href.split("/events/")[-1].split("?")[0]
+        if not href:
+            continue
+
+        if title in acct_state["registered_events"]:
+            log.info(f"[{email}]   跳过（已注册）: {title}")
+            continue
+
+        log.info(f"[{email}]   注册: {title}")
+        url = href.replace("/en/public/", "/en/home/")
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             await human_delay(2, 4)
 
-            for sel in ["button:has-text('Confirm')", "button:has-text('Submit')", "button:has-text('OK')"]:
+            for sel in ["button:has-text('Register')", "button:has-text('Confirm')",
+                        "button:has-text('Submit')", "button:has-text('RSVP')"]:
                 try:
-                    cb = page.locator(sel).last
+                    cb = page.locator(sel).first
                     if await cb.is_visible(timeout=3000):
                         await cb.click()
                         await human_delay(1, 2)
@@ -897,32 +914,26 @@ async def register_events(page: Page, email: str, acct_state: dict) -> int:
                 except Exception:
                     pass
 
-            try:
-                close_btn = page.locator("button[aria-label='Close'], [class*='close']").first
-                if await close_btn.is_visible(timeout=2000):
-                    await close_btn.click()
-                    await human_delay(1, 2)
-            except Exception:
-                pass
-
             acct_state["registered_events"].append(title)
             registered_count += 1
             log.info(f"[{email}]   注册成功 (+5分): {title}")
-            await page.keyboard.press("Escape")
+            await page.goto(EVENTS_URL, wait_until="domcontentloaded", timeout=30000)
             await human_delay(2, 3)
 
         except Exception as e:
             log.warning(f"[{email}]   注册跳过 ({title}): {e}")
+            try:
+                await page.goto(EVENTS_URL, wait_until="domcontentloaded", timeout=30000)
+            except Exception:
+                pass
 
     log.info(f"[{email}] Events 完成：注册 {registered_count} 个活动 (+{registered_count*5}分)")
     return registered_count
 
 
 # ─── 任务 4：发帖 ─────────────────────────────────────────────────────────────
-# ✅ 删除了 find_forum_url()，直接使用 FORUM_URL 常量
 async def create_post(page: Page, email: str) -> bool:
     log.info(f"[{email}] === 任务4：Discussions 发帖 ===")
-    # ✅ 修复：直接导航到正确的论坛 URL
     await page.goto(FORUM_URL, wait_until="domcontentloaded")
     await human_delay(3, 5)
 
@@ -1009,31 +1020,41 @@ async def create_post(page: Page, email: str) -> bool:
 # ─── 任务 5：评论 ─────────────────────────────────────────────────────────────
 async def comment_on_posts(page: Page, email: str) -> int:
     log.info(f"[{email}] === 任务5：Discussions 评论 2 条帖子 ===")
-    # ✅ 修复：直接导航到正确的论坛 URL
     await page.goto(FORUM_URL, wait_until="domcontentloaded")
     await human_delay(3, 5)
 
     commented = 0
     TARGET    = 2
 
-    # ✅ 修复：帖子链接格式已更新为 /en/ 路径
-    post_link_sel = (
-        "a[href*='/en/public/posts/'], a[href*='/en/home/posts/'], "
-        "a[href*='/en/public/forum/'], a[href*='/en/home/forum/']"
-    )
-
-    try:
-        await page.wait_for_selector(post_link_sel, timeout=10000)
-    except Exception:
-        log.warning(f"[{email}] 帖子列表未加载，尝试更宽松的选择器")
-        post_link_sel = "main a[href*='/en/'], article a[href*='/en/']"
-
-    post_links = await page.locator(post_link_sel).all()
-    hrefs = []
-    for lnk in post_links:
-        href = await lnk.get_attribute("href")
-        if href and href not in hrefs:
-            hrefs.append(href)
+    # ✅ 修复4：用 JS 一次性提取帖子链接，避免 locator.all() 逐个操作超时
+    hrefs: list[str] = await page.evaluate('''
+        () => {
+            const seen = new Set();
+            const results = [];
+            const sels = [
+                "a[href*='/en/public/posts/']", "a[href*='/en/home/posts/']",
+                "a[href*='/en/public/forum/']", "a[href*='/en/home/forum/']"
+            ];
+            for (const sel of sels) {
+                document.querySelectorAll(sel).forEach(a => {
+                    if (a.href && !seen.has(a.href)) {
+                        seen.add(a.href);
+                        results.push(a.href);
+                    }
+                });
+            }
+            // 降级
+            if (results.length === 0) {
+                document.querySelectorAll("main a[href*='/en/'], article a[href*='/en/']").forEach(a => {
+                    if (a.href && !seen.has(a.href)) {
+                        seen.add(a.href);
+                        results.push(a.href);
+                    }
+                });
+            }
+            return results;
+        }
+    ''')
 
     log.info(f"[{email}] 发现 {len(hrefs)} 个帖子")
     target_posts = hrefs[1:TARGET + 4] if len(hrefs) > 1 else hrefs
@@ -1043,7 +1064,6 @@ async def comment_on_posts(page: Page, email: str) -> int:
             break
 
         url = href if href.startswith("http") else f"{BASE_URL}{href}"
-        # ✅ 修复：public → home 才能在登录态访问
         url = url.replace("/en/public/", "/en/home/")
 
         try:
